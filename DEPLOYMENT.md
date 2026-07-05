@@ -1,223 +1,465 @@
-# Deployment Playbook — AI BankApp on EKS
+# AI BankApp DevOps - Deployment Guide
 
-Step-by-step commands to deploy the full stack. Run these in order.
+This guide walks you through provisioning the AWS infrastructure, configuring Kubernetes, deploying the application with ArgoCD, enabling Gateway API with Envoy Gateway, configuring HTTPS using cert-manager, and verifying the deployment.
 
-## Prerequisites
+---
 
-- AWS CLI configured (`aws configure`)
-- Terraform >= 1.5.7
-- kubectl
-- Helm 3 (`brew install helm`)
-- Docker (for local image builds)
-- GitHub repo secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
+# Prerequisites
 
-## Step 1: Provision Infrastructure
+Update the system packages.
 
 ```bash
-cd terraform
-terraform init
+sudo apt-get update -y
+sudo apt-get upgrade -y
+```
+
+## Install Terraform
+
+```bash
+wget -O - https://apt.releases.hashicorp.com/gpg | \
+sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | \
+sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+sudo apt update
+sudo apt install terraform -y
+```
+
+Verify installation.
+
+```bash
+terraform version
+```
+
+---
+
+## Install Helm
+
+```bash
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+chmod 700 get_helm.sh
+./get_helm.sh
+```
+
+Verify installation.
+
+```bash
+helm version
+```
+
+---
+
+## Install AWS CLI
+
+```bash
+sudo apt-get install unzip -y
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+-o "awscliv2.zip"
+
+unzip awscliv2.zip
+
+sudo ./aws/install
+```
+
+Verify installation.
+
+```bash
+aws --version
+```
+
+---
+
+## Install kubectl
+
+```bash
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+```
+
+Verify installation.
+
+```bash
+kubectl version --client
+```
+
+---
+
+# Step 1 - Clone the Repository
+
+```bash
+git clone https://github.com/RohitRawat891997/AI-BankApp-DevOps.git
+
+cd AI-BankApp-DevOps/terraform
+```
+
+Initialize Terraform.
+
+```bash
+terraform init --upgrade
+```
+
+Validate the configuration.
+
+```bash
+terraform validate
+```
+
+---
+
+## Terraform Validation Warning
+
+If you receive the following warning:
+
+```text
+Warning: Deprecated value used
+
+data.aws_region.current.name
+
+name is deprecated. Use region instead.
+```
+
+Update the Terraform module using:
+
+```bash
+sed -i 's/data\.aws_region\.current\.name/data.aws_region.current.region/' \
+.terraform/modules/ebs_csi_irsa/modules/iam-role-for-service-accounts-eks/main.tf
+```
+
+Verify the change.
+
+```bash
+sed -n '9p' \
+.terraform/modules/ebs_csi_irsa/modules/iam-role-for-service-accounts-eks/main.tf
+```
+
+Expected output:
+
+```text
+region = data.aws_region.current.region
+```
+
+---
+
+## Provision AWS Infrastructure
+
+```bash
 terraform plan
 terraform apply
-# Takes ~15 minutes — creates VPC, EKS cluster (3 nodes), ArgoCD
 ```
 
-## Step 2: Configure kubectl
+Terraform provisions:
+
+- VPC
+- EKS Cluster
+- IAM Roles
+- EBS CSI Driver
+- ArgoCD
+- Prometheus
+- Grafana
+
+---
+
+# Step 2 - Configure kubectl
+
+Configure kubectl to access the EKS cluster.
 
 ```bash
-aws eks update-kubeconfig --name bankapp-eks --region us-west-2
+aws eks update-kubeconfig \
+--name bankapp-eks \
+--region us-west-2
+```
+
+Verify connectivity.
+
+```bash
 kubectl get nodes
-# Should show 3 nodes in Ready state
 ```
 
-## Step 3: Verify ArgoCD
+Expected output:
+
+- Three worker nodes
+- All nodes should be in **Ready** state.
+
+---
+
+# Step 3 - Verify ArgoCD
+
+Check ArgoCD pods.
 
 ```bash
-# Check all pods are Running
 kubectl get pods -n argocd
-
-# Get ArgoCD URL
-kubectl get svc argocd-server -n argocd \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-
-# Get admin password
-kubectl get secret argocd-initial-admin-secret -n argocd \
-  -o jsonpath='{.data.password}' | base64 -d; echo
-
-# Login: admin / <password>
 ```
 
-## Step 4: Install Gateway API + Envoy Gateway
+Get the ArgoCD LoadBalancer hostname.
 
 ```bash
-# Install Gateway API CRDs — MUST use --server-side
-# Without it, Envoy Gateway helm install fails with CRD ownership conflicts
+kubectl get svc argocd-server -n argocd \
+-o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+Retrieve the admin password.
+
+```bash
+kubectl get secret argocd-initial-admin-secret \
+-n argocd \
+-o jsonpath='{.data.password}' | base64 -d
+```
+
+Login credentials:
+
+```
+Username : admin
+Password : <above password>
+```
+
+---
+
+# Step 4 - Install Gateway API and Envoy Gateway
+
+Install Gateway API CRDs.
+
+```bash
 kubectl apply --server-side \
-  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+```
 
-# Install Envoy Gateway — MUST use --skip-crds since Gateway API CRDs already exist
+> **Note**
+>
+> Use `--server-side`. Without it, Envoy Gateway installation may fail because of CRD ownership conflicts.
+
+Install Envoy Gateway.
+
+```bash
 helm install eg oci://docker.io/envoyproxy/gateway-helm \
-  --version v1.2.6 \
-  -n envoy-gateway-system \
-  --create-namespace \
-  --skip-crds \
-  --wait
+--version v1.2.6 \
+--namespace envoy-gateway-system \
+--create-namespace \
+--skip-crds \
+--wait
+```
 
-# --skip-crds also skips Envoy Gateway's own extension CRDs, install them separately
-helm pull oci://docker.io/envoyproxy/gateway-helm --version v1.2.6 --untar -d /tmp/eg-chart
-kubectl apply --server-side -f /tmp/eg-chart/gateway-helm/crds/generated/
-kubectl rollout restart deployment envoy-gateway -n envoy-gateway-system
+Install Envoy Gateway CRDs.
 
-# Verify
+```bash
+helm pull oci://docker.io/envoyproxy/gateway-helm \
+--version v1.2.6 \
+--untar \
+-d /tmp/eg-chart
+
+kubectl apply --server-side \
+-f /tmp/eg-chart/gateway-helm/crds/generated/
+```
+
+Restart Envoy Gateway.
+
+```bash
+kubectl rollout restart deployment envoy-gateway \
+-n envoy-gateway-system
+```
+
+Verify installation.
+
+```bash
 kubectl get gatewayclass
 ```
 
-## Step 5: Install cert-manager (TLS/HTTPS)
+---
+
+# Step 5 - Install cert-manager
 
 ```bash
-helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
-  --namespace cert-manager \
-  --create-namespace \
-  --set crds.enabled=true \
-  --set config.enableGatewayAPI=true \
-  --wait
+helm install cert-manager \
+oci://quay.io/jetstack/charts/cert-manager \
+--namespace cert-manager \
+--create-namespace \
+--set crds.enabled=true \
+--set config.enableGatewayAPI=true \
+--wait
+```
 
-# Verify
+Verify installation.
+
+```bash
 kubectl get pods -n cert-manager
 ```
 
-After ArgoCD syncs the ClusterIssuer and updated Gateway (with HTTPS listener), cert-manager automatically provisions a Let's Encrypt TLS certificate.
+All pods should be **Running**.
 
-**Prerequisite:** Create a CNAME in GoDaddy:
-- `bankapp.trainwithshubham.com` → `<NLB hostname from Step 4>`
+---
 
-```bash
-# Check certificate status
-kubectl get certificate -n bankapp
-kubectl get secret bankapp-tls -n bankapp
-```
+# Step 6 - Deploy the Application
 
-## Step 6: Install kube-prometheus-stack
-
-```bash
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update prometheus-community
-
-helm install kube-prometheus prometheus-community/kube-prometheus-stack \
-  -n monitoring \
-  --create-namespace \
-  --set grafana.service.type=LoadBalancer \
-  --wait
-
-# Get Grafana URL
-kubectl get svc kube-prometheus-grafana -n monitoring \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-
-# Get Grafana password
-kubectl get secret kube-prometheus-grafana -n monitoring \
-  -o jsonpath='{.data.admin-password}' | base64 -d; echo
-
-# Login: admin / <password>
-```
-
-## Step 7: Build & Push Docker Image
-
-> CI does this automatically on push to `feat/gitops`. This step is only needed for the **first deploy** (image doesn't exist on DockerHub yet).
-
-```bash
-# IMPORTANT: EKS runs amd64 nodes. If building on Apple Silicon (M1/M2/M3),
-# you MUST specify --platform linux/amd64 or pods will fail with:
-#   "no match for platform in manifest: not found"
-
-docker buildx build --platform linux/amd64 \
-  -t trainwithshubham/ai-bankapp-eks:latest \
-  --push .
-```
-
-## Step 8: Deploy via ArgoCD
+Deploy the ArgoCD application.
 
 ```bash
 kubectl apply -f argocd/application.yml
+```
 
-# Watch sync progress
+Watch the synchronization.
+
+```bash
 kubectl get application bankapp -n argocd -w
 ```
 
-## Step 9: Verify Everything
+---
+
+# Step 7 - Verify the Deployment
+
+Verify all application pods.
 
 ```bash
-# All pods should be Running
 kubectl get pods -n bankapp
+```
 
-# Check PVCs are Bound
+Check Persistent Volume Claims.
+
+```bash
 kubectl get pvc -n bankapp
+```
 
-# Check Gateway has an address
+Verify Gateway.
+
+```bash
 kubectl get gateway -n bankapp
+```
 
-# Get the app URL (NLB created by Envoy Gateway)
-kubectl get svc -n envoy-gateway-system \
-  -l gateway.envoyproxy.io/owning-gateway-name=bankapp-gateway \
-  -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}'
+Retrieve the Envoy Gateway LoadBalancer hostname.
 
-# Test — should return 302 (Spring Security redirect to /login)
+```bash
+kubectl get svc \
+-n envoy-gateway-system \
+-l gateway.envoyproxy.io/owning-gateway-name=bankapp-gateway \
+-o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}'
+```
+
+---
+
+## Verify Application
+
+The home page should return **302** because Spring Security redirects to the login page.
+
+```bash
 curl -s -o /dev/null -w "%{http_code}" http://<APP_URL>/
-
-# Test login page — should return 200
-curl -s -o /dev/null -w "%{http_code}" -L http://<APP_URL>/login
 ```
 
-## Step 10: Pull Ollama Model
+Expected:
 
-```bash
-# Ollama starts empty — pull the AI model
-kubectl exec -n bankapp deploy/ollama -- ollama pull tinyllama
+```
+302
 ```
 
-## Cleanup
-
-> **ORDER MATTERS.** Helm-installed resources (Envoy Gateway, Grafana) create AWS Load Balancers
-> and Security Groups outside of Terraform. If you run `terraform destroy` first, the EKS cluster
-> is gone but those orphaned resources block VPC deletion. Always clean up in this order:
+Verify the login page.
 
 ```bash
-# 1. Delete ArgoCD app (removes Gateway → deletes Envoy Gateway NLB)
+curl -L -s -o /dev/null -w "%{http_code}" \
+http://<APP_URL>/login
+```
+
+Expected:
+
+```
+200
+```
+
+---
+
+# Step 8 - Pull the Ollama Model
+
+The Ollama container starts without any models.
+
+Pull TinyLlama.
+
+```bash
+kubectl exec \
+-n bankapp \
+deploy/ollama \
+-- ollama pull tinyllama
+```
+
+---
+
+# Cleanup
+
+Delete all Kubernetes resources.
+
+```bash
 kubectl delete -f argocd/application.yml
 
-# 2. Uninstall all Helm releases that created LoadBalancers/resources
 helm uninstall cert-manager -n cert-manager
+
 helm uninstall kube-prometheus -n monitoring
+
 helm uninstall eg -n envoy-gateway-system
+```
 
-# 3. Delete Gateway API CRDs
-kubectl delete -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+Delete Gateway API CRDs.
 
-# 4. Wait for Load Balancers to fully terminate (~30-60 seconds)
-echo "Waiting for LBs to terminate..."
+```bash
+kubectl delete \
+-f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.1/standard-install.yaml
+```
+
+Wait for AWS Load Balancers to terminate.
+
+```bash
 sleep 60
+```
 
-# 5. Verify no Load Balancers remain in the VPC
-aws elb describe-load-balancers --region us-west-2 \
-  --query 'LoadBalancerDescriptions[*].LoadBalancerName' --output text
-# Should be empty. If not, delete manually:
-# aws elb delete-load-balancer --load-balancer-name <name> --region us-west-2
+Verify no Load Balancers remain.
 
-# 6. Destroy infrastructure
+```bash
+aws elb describe-load-balancers \
+--region us-west-2 \
+--query 'LoadBalancerDescriptions[*].LoadBalancerName' \
+--output text
+```
+
+Destroy the infrastructure.
+
+```bash
 cd terraform
+
 terraform destroy
 ```
 
-**If `terraform destroy` gets stuck on VPC deletion**, orphaned resources remain:
+---
+
+# Troubleshooting
+
+## Terraform destroy gets stuck while deleting the VPC
+
+List orphaned Security Groups.
+
 ```bash
-# Find and delete orphaned security groups
-aws ec2 describe-security-groups --region us-west-2 \
-  --filters Name=vpc-id,Values=<VPC_ID> \
-  --query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName]' --output table
-aws ec2 delete-security-group --group-id <SG_ID> --region us-west-2
+aws ec2 describe-security-groups \
+--region us-west-2 \
+--filters Name=vpc-id,Values=<VPC_ID> \
+--query 'SecurityGroups[?GroupName!=`default`].[GroupId,GroupName]' \
+--output table
+```
 
-# Then delete the VPC manually
-aws ec2 delete-vpc --vpc-id <VPC_ID> --region us-west-2
+Delete the Security Group.
 
-# Re-run terraform destroy to clean the state
+```bash
+aws ec2 delete-security-group \
+--group-id <SG_ID> \
+--region us-west-2
+```
+
+Delete the VPC.
+
+```bash
+aws ec2 delete-vpc \
+--vpc-id <VPC_ID> \
+--region us-west-2
+```
+
+Run Terraform destroy again.
+
+```bash
 terraform destroy
 ```
 
