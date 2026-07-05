@@ -13,7 +13,7 @@ permissions:
   contents: write
 
 env:
-  DOCKERHUB_REPO: trainwithshubham/ai-bankapp-eks
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/ai-bankapp-eks
 
 jobs:
   build-and-push:
